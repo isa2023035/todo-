@@ -1,17 +1,20 @@
 
 import React, { useState, useEffect, useRef } from 'react';
+import { io } from 'socket.io-client';
 import { Task, Priority, TaskComment } from './types';
+
+const socket = io();
 import { TIME_SLOTS, INITIAL_TASKS, TIME_OPTIONS } from './constants';
 import { TimeSlot } from './components/TimeSlot';
 import { TaskCard } from './components/TaskCard';
 import { Calendar } from './components/Calendar';
 
-const CURRENT_USER = '山田 太郎';
-
 type TabType = 'calendar' | 'schedule' | 'completed';
 
 const App: React.FC = () => {
-  const [tasks, setTasks] = useState<Task[]>(INITIAL_TASKS);
+  const [userName, setUserName] = useState(() => localStorage.getItem('userName') || 'ゲスト');
+  const [isSettingName, setIsSettingName] = useState(!localStorage.getItem('userName'));
+  const [tasks, setTasks] = useState<Task[]>([]);
   const [isAdding, setIsAdding] = useState(false);
   const [showSummary, setShowSummary] = useState(false);
   const [isTransitioning, setIsTransitioning] = useState(false);
@@ -30,8 +33,8 @@ const App: React.FC = () => {
     isRoutine: false,
     priority: 'Medium' as Priority,
     notificationMinutesBefore: 0,
-    assignee: CURRENT_USER,
-    creator: CURRENT_USER,
+    assignee: userName,
+    creator: userName,
     notes: '',
     attachments: [] as { id: string, name: string, url: string, type: string }[]
   });
@@ -40,6 +43,33 @@ const App: React.FC = () => {
 
   const [notifications, setNotifications] = useState<{id: string, message: string}[]>([]);
   const notifiedTasksRef = useRef<Set<string>>(new Set());
+
+  // Socket.io synchronization
+  useEffect(() => {
+    socket.on('tasks:init', (initialTasks: Task[]) => {
+      if (initialTasks.length > 0) {
+        setTasks(initialTasks);
+      } else {
+        setTasks(INITIAL_TASKS);
+        socket.emit('tasks:sync', INITIAL_TASKS);
+      }
+    });
+
+    socket.on('tasks:updated', (updatedTasks: Task[]) => {
+      setTasks(updatedTasks);
+    });
+
+    return () => {
+      socket.off('tasks:init');
+      socket.off('tasks:updated');
+    };
+  }, []);
+
+  // Sync tasks to server whenever they change locally
+  const syncTasks = (newTasks: Task[]) => {
+    setTasks(newTasks);
+    socket.emit('tasks:sync', newTasks);
+  };
 
   useEffect(() => {
     if ('Notification' in window && Notification.permission === 'default') {
@@ -98,27 +128,25 @@ const App: React.FC = () => {
   };
 
   const handleTimeUpdate = (taskId: string, newStartTime: string) => {
-    setTasks((prevTasks) =>
-      prevTasks.map((task) =>
-        task.id === taskId ? { ...task, startTime: newStartTime, status: task.status === 'done' ? 'done' : 'todo' } : task
-      )
+    const updatedTasks = tasks.map((task) =>
+      task.id === taskId ? { ...task, startTime: newStartTime, status: task.status === 'done' ? 'done' : 'todo' } : task
     );
+    syncTasks(updatedTasks);
   };
 
   const handleToggleTaskStatus = (taskId: string) => {
-    setTasks((prevTasks) =>
-      prevTasks.map((task) => {
-        if (task.id === taskId) {
-          const isCurrentlyDone = task.status === 'done';
-          return {
-            ...task,
-            status: isCurrentlyDone ? 'todo' : 'done',
-            completedBy: isCurrentlyDone ? undefined : CURRENT_USER
-          };
-        }
-        return task;
-      })
-    );
+    const updatedTasks = tasks.map((task) => {
+      if (task.id === taskId) {
+        const isCurrentlyDone = task.status === 'done';
+        return {
+          ...task,
+          status: isCurrentlyDone ? 'todo' : 'done',
+          completedBy: isCurrentlyDone ? undefined : userName
+        };
+      }
+      return task;
+    });
+    syncTasks(updatedTasks);
     if (selectedTask?.id === taskId) {
       setSelectedTask(prev => prev ? {
         ...prev,
@@ -133,7 +161,8 @@ const App: React.FC = () => {
 
   const confirmDelete = () => {
     if (taskToDelete) {
-      setTasks((prevTasks) => prevTasks.filter((task) => task.id !== taskToDelete));
+      const updatedTasks = tasks.filter((task) => task.id !== taskToDelete);
+      syncTasks(updatedTasks);
       setTaskToDelete(null);
     }
   };
@@ -147,19 +176,18 @@ const App: React.FC = () => {
       nextDate.setDate(nextDate.getDate() + 1);
       const nextDateStr = nextDate.toISOString().split('T')[0];
 
-      setTasks(prev => {
-        const currentRoutines = prev.filter(t => t.isRoutine && t.date === selectedDateStr);
-        const nextDayRoutines = currentRoutines.map(t => ({
-          ...t,
-          id: `${t.id.split('-')[0]}-${nextDateStr}`,
-          status: 'todo' as const,
-          date: nextDateStr,
-          completedBy: undefined
-        }));
+      const currentRoutines = tasks.filter(t => t.isRoutine && t.date === selectedDateStr);
+      const nextDayRoutines = currentRoutines.map(t => ({
+        ...t,
+        id: `${t.id.split('-')[0]}-${nextDateStr}`,
+        status: 'todo' as const,
+        date: nextDateStr,
+        completedBy: undefined
+      }));
 
-        const cleanedTasks = prev.filter(t => t.status !== 'done' || t.date !== selectedDateStr);
-        return [...cleanedTasks, ...nextDayRoutines];
-      });
+      const cleanedTasks = tasks.filter(t => t.status !== 'done' || t.date !== selectedDateStr);
+      const updatedTasks = [...cleanedTasks, ...nextDayRoutines];
+      syncTasks(updatedTasks);
       
       setSelectedDate(nextDate);
       setActiveTab('schedule');
@@ -191,7 +219,8 @@ const App: React.FC = () => {
       notificationMinutesBefore: newTask.notificationMinutesBefore > 0 ? newTask.notificationMinutesBefore : undefined
     };
 
-    setTasks([...tasks, task]);
+    const updatedTasks = [...tasks, task];
+    syncTasks(updatedTasks);
     setIsAdding(false);
     setNewTask({ 
       title: '', 
@@ -200,8 +229,8 @@ const App: React.FC = () => {
       isRoutine: false, 
       priority: 'Medium', 
       notificationMinutesBefore: 0,
-      assignee: CURRENT_USER,
-      creator: CURRENT_USER,
+      assignee: userName,
+      creator: userName,
       notes: '',
       attachments: []
     });
@@ -230,10 +259,11 @@ const App: React.FC = () => {
                 attachments: [...prev.attachments, newAttachment]
               }));
             } else if (taskId) {
-              setTasks(prev => prev.map(t => t.id === taskId ? {
+              const updatedTasks = tasks.map(t => t.id === taskId ? {
                 ...t,
                 attachments: [...(t.attachments || []), newAttachment]
-              } : t));
+              } : t);
+              syncTasks(updatedTasks);
               setSelectedTask(prev => prev?.id === taskId ? {
                 ...prev,
                 attachments: [...(prev.attachments || []), newAttachment]
@@ -267,10 +297,11 @@ const App: React.FC = () => {
             attachments: [...prev.attachments, newAttachment]
           }));
         } else if (taskId) {
-          setTasks(prev => prev.map(t => t.id === taskId ? {
+          const updatedTasks = tasks.map(t => t.id === taskId ? {
             ...t,
             attachments: [...(t.attachments || []), newAttachment]
-          } : t));
+          } : t);
+          syncTasks(updatedTasks);
           setSelectedTask(prev => prev?.id === taskId ? {
             ...prev,
             attachments: [...(prev.attachments || []), newAttachment]
@@ -288,10 +319,11 @@ const App: React.FC = () => {
         attachments: prev.attachments.filter(a => a.id !== attachmentId)
       }));
     } else if (taskId) {
-      setTasks(prev => prev.map(t => t.id === taskId ? {
+      const updatedTasks = tasks.map(t => t.id === taskId ? {
         ...t,
         attachments: t.attachments?.filter(a => a.id !== attachmentId)
-      } : t));
+      } : t);
+      syncTasks(updatedTasks);
       setSelectedTask(prev => prev?.id === taskId ? {
         ...prev,
         attachments: prev.attachments?.filter(a => a.id !== attachmentId)
@@ -305,14 +337,15 @@ const App: React.FC = () => {
     const newComment: TaskComment = {
       id: Date.now().toString(),
       text: commentText,
-      author: CURRENT_USER,
+      author: userName,
       createdAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
     };
 
-    setTasks(prev => prev.map(t => t.id === taskId ? {
+    const updatedTasks = tasks.map(t => t.id === taskId ? {
       ...t,
       comments: [...(t.comments || []), newComment]
-    } : t));
+    } : t);
+    syncTasks(updatedTasks);
 
     setSelectedTask(prev => prev?.id === taskId ? {
       ...prev,
@@ -521,6 +554,16 @@ const App: React.FC = () => {
         </div>
         
         <div className="flex items-center gap-2 lg:gap-4">
+          <div className="hidden lg:flex flex-col items-end">
+            <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">ユーザー</span>
+            <button 
+              onClick={() => setIsSettingName(true)}
+              className="text-sm font-bold text-indigo-600 hover:text-indigo-700 transition-colors"
+            >
+              {userName}
+            </button>
+          </div>
+          
           <button 
             onClick={() => setShowSummary(true)} 
             className="flex items-center gap-1.5 lg:gap-2 px-2.5 lg:px-4 py-2 border border-slate-200 hover:border-indigo-100 hover:bg-indigo-50 text-slate-600 hover:text-indigo-600 rounded-lg text-xs lg:text-sm font-bold transition-all"
@@ -541,9 +584,49 @@ const App: React.FC = () => {
           </button>
 
           <div className="hidden lg:block w-px h-6 bg-slate-200" />
-          <div className="w-8 h-8 rounded-full bg-slate-100 hidden lg:flex items-center justify-center text-xs font-bold text-slate-600 border border-slate-200">{CURRENT_USER.substring(0, 1)}</div>
+          <div className="w-8 h-8 rounded-full bg-slate-100 hidden lg:flex items-center justify-center text-xs font-bold text-slate-600 border border-slate-200">{userName.substring(0, 1)}</div>
         </div>
       </header>
+
+      {/* User Name Modal */}
+      {isSettingName && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-md z-[500] flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl shadow-2xl w-full max-sm overflow-hidden animate-in fade-in zoom-in duration-300">
+            <div className="p-8 text-center">
+              <div className="w-16 h-16 bg-indigo-100 text-indigo-600 rounded-2xl flex items-center justify-center mx-auto mb-6">
+                <svg className="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" /></svg>
+              </div>
+              <h2 className="text-xl font-bold text-slate-800 mb-2">お名前を教えてください</h2>
+              <p className="text-sm text-slate-500 mb-8">共有・編集時にこの名前が表示されます</p>
+              <input 
+                autoFocus
+                type="text" 
+                className="w-full px-6 py-4 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-2 focus:ring-indigo-500 text-center font-bold text-slate-700 mb-6"
+                placeholder="お名前"
+                value={userName}
+                onChange={e => setUserName(e.target.value)}
+                onKeyDown={e => {
+                  if (e.key === 'Enter' && userName.trim()) {
+                    localStorage.setItem('userName', userName);
+                    setIsSettingName(false);
+                  }
+                }}
+              />
+              <button 
+                onClick={() => {
+                  if (userName.trim()) {
+                    localStorage.setItem('userName', userName);
+                    setIsSettingName(false);
+                  }
+                }}
+                className="w-full py-4 bg-indigo-600 text-white rounded-2xl font-bold hover:bg-indigo-700 transition-all shadow-lg shadow-indigo-100"
+              >
+                はじめる
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Task Detail Modal */}
       {selectedTask && (
